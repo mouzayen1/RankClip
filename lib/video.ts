@@ -433,107 +433,110 @@ export async function exportVideo(
     // Mute all gain nodes initially
     for (const g of gainNodes) g.gain.value = 0;
 
-    // 5. RENDER EACH CLIP (countdown: lowest rank first, #1 last)
-    const totalClips = clips.length;
-    let step = 0;
-
-    async function renderClip() {
-      if (step >= totalClips) {
-        onProgress({ percent: 100, status: 'Finalizing...' });
-        recorder.stop();
-        return;
-      }
-
-      const clipIndex = totalClips - 1 - step;
-      const video = videos[clipIndex];
-      const firstVisibleIndex = clipIndex;
-
-      onProgress({
-        percent: 15 + Math.round((step / totalClips) * 80),
-        status: `Preparing #${clipIndex + 1}: ${clips[clipIndex].label}`,
-      });
-
-      // Seek to beginning and wait
-      video.currentTime = 0;
+    // 5. Helper: seek a video to 0, play it, and wait until it has frames ready
+    async function prepareVideo(v: HTMLVideoElement): Promise<void> {
+      v.currentTime = 0;
       await new Promise<void>((res) => {
-        const done = () => res();
-        video.addEventListener('seeked', done, { once: true });
-        setTimeout(done, 3000);
+        v.addEventListener('seeked', () => res(), { once: true });
+        setTimeout(res, 3000);
       });
-
-      // Enable audio for this clip, mute all others
-      for (let g = 0; g < gainNodes.length; g++) {
-        gainNodes[g].gain.value = g === clipIndex ? 1 : 0;
-      }
-
-      // Start playback and wait for it to actually begin
-      try {
-        await video.play();
-      } catch {}
-
-      // Wait until the video is producing frames
-      if (video.readyState < 2) {
+      try { await v.play(); } catch {}
+      if (v.readyState < 2) {
         await new Promise<void>((res) => {
           const check = () => {
-            if (video.readyState >= 2) res();
+            if (v.readyState >= 2) res();
             else requestAnimationFrame(check);
           };
           check();
           setTimeout(res, 2000);
         });
       }
+      // Pause immediately — we just needed it buffered and ready
+      v.pause();
+      v.currentTime = 0;
+      await new Promise<void>((res) => {
+        v.addEventListener('seeked', () => res(), { once: true });
+        setTimeout(res, 1000);
+      });
+    }
+
+    // 6. PRE-BUFFER ALL CLIPS so there's zero delay between them
+    for (let i = 0; i < videos.length; i++) {
+      onProgress({
+        percent: 12 + Math.round(((i + 1) / videos.length) * 8),
+        status: `Buffering clip ${i + 1}/${videos.length}...`,
+      });
+      await prepareVideo(videos[i]);
+    }
+
+    // 7. RENDER EACH CLIP (countdown: lowest rank first, #1 last)
+    const totalClips = clips.length;
+
+    for (let step = 0; step < totalClips; step++) {
+      const clipIndex = totalClips - 1 - step;
+      const video = videos[clipIndex];
+      const firstVisibleIndex = clipIndex;
+
+      // Enable audio for this clip, mute all others
+      for (let g = 0; g < gainNodes.length; g++) {
+        gainNodes[g].gain.value = g === clipIndex ? 1 : 0;
+      }
 
       onProgress({
-        percent: 15 + Math.round((step / totalClips) * 80),
+        percent: 20 + Math.round((step / totalClips) * 75),
         status: `Revealing #${clipIndex + 1}: ${clips[clipIndex].label}`,
       });
 
-      // NOW start the timer
-      const startTime = performance.now();
+      // Play — video is already buffered and seeked to 0, so this is instant
+      try { await video.play(); } catch {}
 
-      function drawFrame() {
-        const elapsed = performance.now() - startTime;
+      // Render frames for this clip's duration
+      await new Promise<void>((resolve) => {
+        const startTime = performance.now();
 
-        if (elapsed >= clipDuration) {
-          video.pause();
-          // Mute this clip's audio
-          gainNodes[clipIndex].gain.value = 0;
-          step++;
-          renderClip();
-          return;
+        function drawFrame() {
+          const elapsed = performance.now() - startTime;
+
+          if (elapsed >= clipDuration) {
+            video.pause();
+            gainNodes[clipIndex].gain.value = 0;
+            resolve();
+            return;
+          }
+
+          // Black background
+          ctx.fillStyle = '#000000';
+          ctx.fillRect(0, 0, width, height);
+
+          // Cover-fill video
+          try {
+            const vw = video.videoWidth || width;
+            const vh = video.videoHeight || height;
+            const scale = Math.max(width / vw, height / vh);
+            const sw = vw * scale;
+            const sh = vh * scale;
+            const sx = (width - sw) / 2;
+            const sy = (height - sh) / 2;
+            ctx.drawImage(video, sx, sy, sw, sh);
+          } catch {}
+
+          // Overlay with countdown reveal
+          drawOverlay(ctx, width, height, config, clips, clipIndex, firstVisibleIndex);
+
+          onProgress({
+            percent: 20 + Math.round(((step + elapsed / clipDuration) / totalClips) * 75),
+            status: `Revealing #${clipIndex + 1}: ${clips[clipIndex].label}`,
+          });
+
+          requestAnimationFrame(drawFrame);
         }
 
-        // Black background
-        ctx.fillStyle = '#000000';
-        ctx.fillRect(0, 0, width, height);
-
-        // Cover-fill video
-        try {
-          const vw = video.videoWidth || width;
-          const vh = video.videoHeight || height;
-          const scale = Math.max(width / vw, height / vh);
-          const sw = vw * scale;
-          const sh = vh * scale;
-          const sx = (width - sw) / 2;
-          const sy = (height - sh) / 2;
-          ctx.drawImage(video, sx, sy, sw, sh);
-        } catch {}
-
-        // Overlay with countdown reveal
-        drawOverlay(ctx, width, height, config, clips, clipIndex, firstVisibleIndex);
-
-        onProgress({
-          percent: 15 + Math.round(((step + elapsed / clipDuration) / totalClips) * 80),
-          status: `Revealing #${clipIndex + 1}: ${clips[clipIndex].label}`,
-        });
-
         requestAnimationFrame(drawFrame);
-      }
-
-      requestAnimationFrame(drawFrame);
+      });
     }
 
-    renderClip();
+    onProgress({ percent: 100, status: 'Finalizing...' });
+    recorder.stop();
 
     })(); // end async IIFE
   });
