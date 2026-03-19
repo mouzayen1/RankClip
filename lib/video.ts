@@ -28,16 +28,93 @@ export function pickRecorderMime(): { mimeType: string; ext: string } {
   return { mimeType: 'video/webm', ext: 'webm' };
 }
 
-/** Fix WebM duration/seeking metadata. No-op for MP4. */
+/** Fix duration/seeking metadata for both MP4 and WebM. */
 export async function fixBlobMetadata(
   blob: Blob,
   durationMs: number
 ): Promise<Blob> {
-  if (blob.type.startsWith('video/mp4')) return blob;
+  if (blob.type.startsWith('video/mp4')) {
+    return fixMp4Duration(blob, durationMs);
+  }
   // fix-webm-duration patches the WebM header with correct duration + cues
   return new Promise<Blob>((resolve) => {
     fixWebmDuration(blob, durationMs, (fixed: Blob) => resolve(fixed));
   });
+}
+
+/**
+ * Patches MP4 duration metadata in the mvhd, tkhd, and mdhd boxes.
+ * MediaRecorder on Chrome often writes incorrect duration headers,
+ * making the video un-seekable and un-uploadable to platforms like TikTok.
+ */
+async function fixMp4Duration(blob: Blob, durationMs: number): Promise<Blob> {
+  const buffer = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+  let movieTimescale = 0;
+
+  function readStr(offset: number): string {
+    return String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
+  }
+
+  function walkBoxes(start: number, end: number) {
+    let pos = start;
+    while (pos + 8 <= end) {
+      const size = view.getUint32(pos);
+      const type = readStr(pos + 4);
+
+      if (size === 0) break; // box extends to EOF — stop
+      if (size < 8) break;   // malformed
+
+      const boxEnd = Math.min(pos + size, end);
+      const content = pos + 8; // start of FullBox fields (version + flags + data)
+
+      // Recurse into container boxes
+      if (type === 'moov' || type === 'trak' || type === 'mdia' || type === 'minf' || type === 'stbl') {
+        walkBoxes(content, boxEnd);
+      } else if (type === 'mvhd') {
+        const ver = bytes[content];
+        if (ver === 0) {
+          // v0: timescale @+12, duration @+16 (4 bytes each)
+          movieTimescale = view.getUint32(content + 12);
+          view.setUint32(content + 16, Math.round((durationMs / 1000) * movieTimescale));
+        } else {
+          // v1: timescale @+20 (4 bytes), duration @+24 (8 bytes)
+          movieTimescale = view.getUint32(content + 20);
+          const dur = Math.round((durationMs / 1000) * movieTimescale);
+          view.setUint32(content + 24, 0);   // high 32 bits
+          view.setUint32(content + 28, dur); // low 32 bits
+        }
+      } else if (type === 'tkhd' && movieTimescale > 0) {
+        const ver = bytes[content];
+        const dur = Math.round((durationMs / 1000) * movieTimescale);
+        if (ver === 0) {
+          // v0: duration @+20
+          view.setUint32(content + 20, dur);
+        } else {
+          // v1: duration @+28 (8 bytes)
+          view.setUint32(content + 28, 0);
+          view.setUint32(content + 32, dur);
+        }
+      } else if (type === 'mdhd') {
+        const ver = bytes[content];
+        if (ver === 0) {
+          const mediaTimescale = view.getUint32(content + 12);
+          view.setUint32(content + 16, Math.round((durationMs / 1000) * mediaTimescale));
+        } else {
+          const mediaTimescale = view.getUint32(content + 20);
+          const dur = Math.round((durationMs / 1000) * mediaTimescale);
+          view.setUint32(content + 24, 0);
+          view.setUint32(content + 28, dur);
+        }
+      }
+
+      pos = boxEnd;
+    }
+  }
+
+  walkBoxes(0, bytes.length);
+  return new Blob([buffer], { type: blob.type });
 }
 
 // ─── Test Clip Generation ─────────────────────────────────────────
