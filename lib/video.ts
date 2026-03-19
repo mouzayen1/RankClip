@@ -329,33 +329,62 @@ export async function exportVideo(
 ): Promise<string> {
   const { width, height } = config.resolution;
   const clipDuration = config.clipDuration * 1000; // ms
+  const fadeDuration = 300; // ms — fade-in/fade-out at clip boundaries
 
   onProgress({ percent: 0, status: 'Preloading videos...' });
 
-  // 1. PRELOAD ALL VIDEOS
+  // 1. PRELOAD ALL VIDEOS (muted for now — we'll connect audio via Web Audio)
   const videos: HTMLVideoElement[] = [];
   for (let i = 0; i < clips.length; i++) {
     onProgress({
-      percent: Math.round(((i + 1) / clips.length) * 15),
+      percent: Math.round(((i + 1) / clips.length) * 10),
       status: `Preloading clip ${i + 1}/${clips.length}...`,
     });
     const v = await preloadVideo(clips[i].blobUrl);
     videos.push(v);
   }
 
-  // 2. SET UP CANVAS + RECORDER
+  // 2. SET UP AUDIO — Web Audio API to capture clip audio into the recording
+  const audioCtx = new AudioContext();
+  const audioDest = audioCtx.createMediaStreamDestination();
+
+  // Pre-create audio source nodes for each video
+  // Note: createMediaElementSource can only be called once per element
+  const audioSources: MediaElementAudioSourceNode[] = [];
+  const gainNodes: GainNode[] = [];
+  for (const v of videos) {
+    v.muted = false; // unmute so audio flows through the source node
+    v.volume = 1;
+    const source = audioCtx.createMediaElementSource(v);
+    const gain = audioCtx.createGain();
+    gain.gain.value = 0; // start silent — we'll enable per-clip
+    source.connect(gain);
+    gain.connect(audioDest);
+    audioSources.push(source);
+    gainNodes.push(gain);
+  }
+
+  // 3. SET UP CANVAS + COMBINED STREAM (video + audio)
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
   const ctx = canvas.getContext('2d')!;
 
-  const stream = canvas.captureStream(30);
-  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+  const videoStream = canvas.captureStream(30);
+  const combinedStream = new MediaStream([
+    ...videoStream.getVideoTracks(),
+    ...audioDest.stream.getAudioTracks(),
+  ]);
+
+  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+    ? 'video/webm;codecs=vp9,opus'
+    : MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
     ? 'video/webm;codecs=vp9'
     : 'video/webm';
-  const recorder = new MediaRecorder(stream, {
+  const recorder = new MediaRecorder(combinedStream, {
     mimeType,
     videoBitsPerSecond: 6000000,
+    audioBitsPerSecond: 128000,
   });
 
   const chunks: Blob[] = [];
@@ -368,12 +397,13 @@ export async function exportVideo(
       const blob = new Blob(chunks, { type: mimeType });
       const url = URL.createObjectURL(blob);
 
-      // 5. CLEANUP
+      // CLEANUP
       for (const v of videos) {
         v.pause();
         v.removeAttribute('src');
         v.load();
       }
+      audioCtx.close().catch(() => {});
 
       resolve(url);
     };
@@ -387,12 +417,12 @@ export async function exportVideo(
     // Use async IIFE since Promise constructor isn't async
     (async () => {
 
-    // 3. PRE-SEEK all videos to time 0 so they're ready to play instantly
+    // 4. PRE-SEEK all videos to time 0
+    onProgress({ percent: 12, status: 'Preparing clips...' });
     const seekPromises = videos.map(
       (v) =>
         new Promise<void>((res) => {
           v.currentTime = 0;
-          v.muted = true;
           const done = () => res();
           v.addEventListener('seeked', done, { once: true });
           setTimeout(done, 3000);
@@ -400,7 +430,10 @@ export async function exportVideo(
     );
     await Promise.all(seekPromises);
 
-    // 4. RENDER EACH CLIP (countdown: lowest rank first, #1 last)
+    // Mute all gain nodes initially
+    for (const g of gainNodes) g.gain.value = 0;
+
+    // 5. RENDER EACH CLIP (countdown: lowest rank first, #1 last)
     const totalClips = clips.length;
     let step = 0;
 
@@ -411,11 +444,8 @@ export async function exportVideo(
         return;
       }
 
-      // Play from lowest rank to highest: clip N-1 first, clip 0 last
       const clipIndex = totalClips - 1 - step;
       const video = videos[clipIndex];
-
-      // firstVisibleIndex decreases as we reveal more items
       const firstVisibleIndex = clipIndex;
 
       onProgress({
@@ -423,7 +453,7 @@ export async function exportVideo(
         status: `Preparing #${clipIndex + 1}: ${clips[clipIndex].label}`,
       });
 
-      // Seek to beginning and wait for it to be ready
+      // Seek to beginning and wait
       video.currentTime = 0;
       await new Promise<void>((res) => {
         const done = () => res();
@@ -431,23 +461,25 @@ export async function exportVideo(
         setTimeout(done, 3000);
       });
 
+      // Enable audio for this clip, mute all others
+      for (let g = 0; g < gainNodes.length; g++) {
+        gainNodes[g].gain.value = g === clipIndex ? 1 : 0;
+      }
+
       // Start playback and wait for it to actually begin
       try {
         await video.play();
       } catch {}
 
-      // Wait until the video is producing frames (readyState >= HAVE_CURRENT_DATA)
+      // Wait until the video is producing frames
       if (video.readyState < 2) {
         await new Promise<void>((res) => {
           const check = () => {
-            if (video.readyState >= 2) {
-              res();
-            } else {
-              requestAnimationFrame(check);
-            }
+            if (video.readyState >= 2) res();
+            else requestAnimationFrame(check);
           };
           check();
-          setTimeout(res, 2000); // safety
+          setTimeout(res, 2000);
         });
       }
 
@@ -456,7 +488,7 @@ export async function exportVideo(
         status: `Revealing #${clipIndex + 1}: ${clips[clipIndex].label}`,
       });
 
-      // NOW start the timer — video is actually playing
+      // NOW start the timer
       const startTime = performance.now();
 
       function drawFrame() {
@@ -464,6 +496,8 @@ export async function exportVideo(
 
         if (elapsed >= clipDuration) {
           video.pause();
+          // Mute this clip's audio
+          gainNodes[clipIndex].gain.value = 0;
           step++;
           renderClip();
           return;
@@ -484,6 +518,21 @@ export async function exportVideo(
           const sy = (height - sh) / 2;
           ctx.drawImage(video, sx, sy, sw, sh);
         } catch {}
+
+        // Fade-in at start, fade-out at end of each clip
+        const fadeIn = Math.min(elapsed / fadeDuration, 1);
+        const fadeOut = Math.min((clipDuration - elapsed) / fadeDuration, 1);
+        const fade = Math.min(fadeIn, fadeOut);
+
+        if (fade < 1) {
+          ctx.fillStyle = `rgba(0, 0, 0, ${1 - fade})`;
+          ctx.fillRect(0, 0, width, height);
+
+          // Also fade audio to match
+          gainNodes[clipIndex].gain.value = fade;
+        } else {
+          gainNodes[clipIndex].gain.value = 1;
+        }
 
         // Overlay with countdown reveal
         drawOverlay(ctx, width, height, config, clips, clipIndex, firstVisibleIndex);

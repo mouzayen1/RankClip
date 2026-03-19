@@ -52,9 +52,9 @@ function uid() {
 export default function RankClipEditor() {
   const [step, setStep] = useState<Step>('Setup');
   const [config, setConfig] = useState<OverlayConfig>({
-    prefix: 'Top 5',
-    highlight: 'funniest',
-    suffix: 'moments',
+    prefix: '',
+    highlight: '',
+    suffix: '',
     highlightColor: HIGHLIGHT_COLORS[0],
     font: FONTS[0].value,
     clipDuration: 4,
@@ -70,7 +70,7 @@ export default function RankClipEditor() {
   const stepIndex = STEPS.indexOf(step);
 
   const canProceed = useCallback(() => {
-    if (step === 'Setup') return config.prefix || config.highlight || config.suffix;
+    if (step === 'Setup') return true;
     if (step === 'Upload') return clips.length >= 2;
     if (step === 'Rank') return clips.length >= 2;
     return true;
