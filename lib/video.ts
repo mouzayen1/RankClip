@@ -468,8 +468,16 @@ export interface DetectionProgress {
 }
 
 /**
- * Analyzes a video for scene changes by comparing pixel differences
- * between sampled frames. Returns timestamps where scene cuts occur.
+ * Analyzes a video for scene changes using two detection strategies:
+ *
+ * 1. BLACK FRAME DETECTION — Identifies dark/black frames (often with text overlays)
+ *    that act as dividers between clips. Segments are trimmed so black frames are excluded.
+ *
+ * 2. HARD CUT DETECTION — Uses adaptive thresholding on pixel differences to find
+ *    instant scene changes where there's no black frame at all.
+ *
+ * The algorithm also tracks per-frame brightness so it can trim black regions from
+ * the start/end of each resulting segment.
  */
 export async function detectScenes(
   file: File,
@@ -500,8 +508,8 @@ export async function detectScenes(
     throw new Error('Video is too short to analyze');
   }
 
-  // Sample frames at intervals — ~4 frames/sec for good detection
-  const sampleInterval = 0.25;
+  // Sample at ~8 fps for high accuracy
+  const sampleInterval = 0.125;
   const totalSamples = Math.floor(duration / sampleInterval);
 
   // Small canvas for fast pixel comparison
@@ -513,78 +521,215 @@ export async function detectScenes(
   const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
 
   let prevPixels: Uint8ClampedArray | null = null;
-  const diffs: { time: number; diff: number }[] = [];
 
-  onProgress({ percent: 0, status: 'Analyzing video for scene changes...' });
+  // Per-frame data: brightness + diff from previous frame
+  const frames: { time: number; brightness: number; diff: number }[] = [];
+
+  onProgress({ percent: 0, status: 'Scanning video frames...' });
 
   for (let i = 0; i < totalSamples; i++) {
     const time = i * sampleInterval;
 
-    // Seek to time
     await new Promise<void>((resolve) => {
       video.currentTime = time;
       video.onseeked = () => resolve();
-      // Safety fallback
       setTimeout(resolve, 2000);
     });
 
     ctx.drawImage(video, 0, 0, sampleWidth, sampleHeight);
     const imageData = ctx.getImageData(0, 0, sampleWidth, sampleHeight);
     const pixels = imageData.data;
+    const pixelCount = pixels.length / 4;
 
+    // Calculate mean brightness (0-255)
+    let brightnessSum = 0;
+    for (let p = 0; p < pixels.length; p += 4) {
+      // Luminance: 0.299R + 0.587G + 0.114B
+      brightnessSum += pixels[p] * 0.299 + pixels[p + 1] * 0.587 + pixels[p + 2] * 0.114;
+    }
+    const brightness = brightnessSum / pixelCount;
+
+    // Calculate pixel diff from previous frame
+    let diff = 0;
     if (prevPixels) {
-      // Calculate mean absolute pixel difference
       let totalDiff = 0;
-      const pixelCount = pixels.length / 4;
       for (let p = 0; p < pixels.length; p += 4) {
-        totalDiff += Math.abs(pixels[p] - prevPixels[p]);     // R
-        totalDiff += Math.abs(pixels[p + 1] - prevPixels[p + 1]); // G
-        totalDiff += Math.abs(pixels[p + 2] - prevPixels[p + 2]); // B
+        totalDiff += Math.abs(pixels[p] - prevPixels[p]);
+        totalDiff += Math.abs(pixels[p + 1] - prevPixels[p + 1]);
+        totalDiff += Math.abs(pixels[p + 2] - prevPixels[p + 2]);
       }
-      const meanDiff = totalDiff / (pixelCount * 3); // 0-255
-      diffs.push({ time, diff: meanDiff });
+      diff = totalDiff / (pixelCount * 3);
     }
 
+    frames.push({ time, brightness, diff });
     prevPixels = new Uint8ClampedArray(pixels);
 
-    if (i % 10 === 0) {
+    if (i % 16 === 0) {
       onProgress({
-        percent: Math.round((i / totalSamples) * 80),
+        percent: Math.round((i / totalSamples) * 70),
         status: `Analyzing frame ${i + 1}/${totalSamples}...`,
       });
     }
   }
 
-  // Find scene cuts: threshold based on sensitivity
-  // sensitivity 0 = threshold ~60 (only massive cuts)
-  // sensitivity 100 = threshold ~8 (very sensitive)
-  const threshold = 60 - (sensitivity / 100) * 52;
-  const minSegmentDuration = 1.0; // Minimum 1 second between cuts
+  // ── STEP 1: Identify black/dark frame regions ──
+  // A frame is "black" if its brightness is below a threshold.
+  // Black title cards often have text so brightness can be ~15-30, not pure 0.
+  const blackThreshold = 25; // brightness below this = "dark frame"
 
-  const cutTimes: number[] = [0]; // Always start at 0
+  // Mark each frame as dark or not
+  const isDark = frames.map((f) => f.brightness < blackThreshold);
 
-  for (let i = 0; i < diffs.length; i++) {
-    if (diffs[i].diff > threshold) {
-      const lastCut = cutTimes[cutTimes.length - 1];
-      if (diffs[i].time - lastCut >= minSegmentDuration) {
-        cutTimes.push(diffs[i].time);
+  // Find contiguous dark regions (potential dividers)
+  const darkRegions: { start: number; end: number }[] = [];
+  let darkStart: number | null = null;
+  for (let i = 0; i < frames.length; i++) {
+    if (isDark[i] && darkStart === null) {
+      darkStart = i;
+    } else if (!isDark[i] && darkStart !== null) {
+      const regionDuration = frames[i].time - frames[darkStart].time;
+      // Only count dark regions >= 0.2s as intentional dividers (not single dark frames from compression)
+      if (regionDuration >= 0.2) {
+        darkRegions.push({ start: darkStart, end: i - 1 });
+      }
+      darkStart = null;
+    }
+  }
+  // Close final dark region if video ends dark
+  if (darkStart !== null) {
+    const regionDuration = frames[frames.length - 1].time - frames[darkStart].time;
+    if (regionDuration >= 0.2) {
+      darkRegions.push({ start: darkStart, end: frames.length - 1 });
+    }
+  }
+
+  // ── STEP 2: Adaptive hard-cut detection on non-dark frames ──
+  // Collect diffs only for non-dark frames to compute statistics
+  const nonDarkDiffs: number[] = [];
+  for (let i = 1; i < frames.length; i++) {
+    if (!isDark[i] && !isDark[i - 1] && frames[i].diff > 0) {
+      nonDarkDiffs.push(frames[i].diff);
+    }
+  }
+
+  // Compute median and MAD (median absolute deviation) for robust threshold
+  nonDarkDiffs.sort((a, b) => a - b);
+  const median = nonDarkDiffs.length > 0
+    ? nonDarkDiffs[Math.floor(nonDarkDiffs.length / 2)]
+    : 5;
+  const mad = nonDarkDiffs.length > 0
+    ? nonDarkDiffs.map((d) => Math.abs(d - median)).sort((a, b) => a - b)[
+        Math.floor(nonDarkDiffs.length / 2)
+      ]
+    : 3;
+
+  // Threshold = median + multiplier * MAD
+  // sensitivity 0 → multiplier ~8 (very few cuts), sensitivity 100 → multiplier ~2 (many cuts)
+  const multiplier = 8 - (sensitivity / 100) * 6;
+  const hardCutThreshold = Math.max(median + multiplier * Math.max(mad, 1), 8);
+
+  // Find hard cuts (non-dark to non-dark transitions with high diff)
+  const hardCutTimes: number[] = [];
+  const minGap = 0.8; // minimum seconds between any two cuts
+  for (let i = 1; i < frames.length; i++) {
+    if (!isDark[i] && !isDark[i - 1] && frames[i].diff > hardCutThreshold) {
+      const lastCut = hardCutTimes.length > 0 ? hardCutTimes[hardCutTimes.length - 1] : -Infinity;
+      if (frames[i].time - lastCut >= minGap) {
+        hardCutTimes.push(frames[i].time);
+      }
+    }
+  }
+
+  onProgress({ percent: 75, status: 'Building segments...' });
+
+  // ── STEP 3: Merge dark-region boundaries + hard cuts into segment list ──
+  // Strategy: dark regions define "gaps" in the video. Content is between gaps.
+  // Hard cuts split content regions that have no dark gap inside them.
+
+  // Build a list of "content intervals" by removing dark regions
+  type Interval = { start: number; end: number };
+  const contentIntervals: Interval[] = [];
+
+  let contentStart = 0;
+  for (const region of darkRegions) {
+    const regionStartTime = frames[region.start].time;
+    const regionEndTime = frames[region.end].time + sampleInterval;
+
+    if (regionStartTime > contentStart + 0.3) {
+      contentIntervals.push({ start: contentStart, end: regionStartTime });
+    }
+    contentStart = regionEndTime;
+  }
+  // Final interval after last dark region
+  if (contentStart < duration - 0.3) {
+    contentIntervals.push({ start: contentStart, end: duration });
+  }
+
+  // If no dark regions were found, the whole video is one content interval
+  if (contentIntervals.length === 0) {
+    contentIntervals.push({ start: 0, end: duration });
+  }
+
+  // Now split content intervals at hard cuts
+  const finalIntervals: Interval[] = [];
+  for (const interval of contentIntervals) {
+    // Find hard cuts within this interval
+    const cutsInInterval = hardCutTimes.filter(
+      (t) => t > interval.start + 0.3 && t < interval.end - 0.3
+    );
+
+    if (cutsInInterval.length === 0) {
+      finalIntervals.push(interval);
+    } else {
+      let segStart = interval.start;
+      for (const cutTime of cutsInInterval) {
+        if (cutTime - segStart >= 0.5) {
+          finalIntervals.push({ start: segStart, end: cutTime });
+        }
+        segStart = cutTime;
+      }
+      if (interval.end - segStart >= 0.5) {
+        finalIntervals.push({ start: segStart, end: interval.end });
+      }
+    }
+  }
+
+  // ── STEP 4: Trim black frames from edges of each interval ──
+  // Even after removing dark regions, segments may start/end with a couple dark frames
+  for (const interval of finalIntervals) {
+    // Trim start: advance past dark frames
+    for (const f of frames) {
+      if (f.time < interval.start) continue;
+      if (f.time > interval.start + 1.0) break; // don't trim more than 1s
+      if (f.brightness < blackThreshold) {
+        interval.start = f.time + sampleInterval;
+      } else {
+        break;
+      }
+    }
+    // Trim end: pull back past dark frames
+    for (let i = frames.length - 1; i >= 0; i--) {
+      if (frames[i].time > interval.end) continue;
+      if (frames[i].time < interval.end - 1.0) break;
+      if (frames[i].brightness < blackThreshold) {
+        interval.end = frames[i].time;
+      } else {
+        break;
       }
     }
   }
 
   onProgress({ percent: 85, status: 'Generating segment thumbnails...' });
 
-  // Build segments
+  // ── STEP 5: Build final segments with thumbnails ──
   const segments: VideoSegment[] = [];
-  for (let i = 0; i < cutTimes.length; i++) {
-    const startTime = cutTimes[i];
-    const endTime = i < cutTimes.length - 1 ? cutTimes[i + 1] : duration;
+  const validIntervals = finalIntervals.filter((iv) => iv.end - iv.start >= 0.5);
 
-    // Skip very short trailing segments
-    if (endTime - startTime < 0.5) continue;
+  for (let i = 0; i < validIntervals.length; i++) {
+    const iv = validIntervals[i];
 
-    // Get thumbnail at segment midpoint
-    const thumbTime = startTime + (endTime - startTime) * 0.3;
+    // Thumbnail at 30% into the segment (avoids transition artifacts at edges)
+    const thumbTime = iv.start + (iv.end - iv.start) * 0.3;
     let thumbnailUrl: string | null = null;
     try {
       await new Promise<void>((resolve) => {
@@ -598,16 +743,16 @@ export async function detectScenes(
 
     segments.push({
       id: Math.random().toString(36).slice(2, 10),
-      startTime,
-      endTime,
+      startTime: Math.round(iv.start * 100) / 100,
+      endTime: Math.round(iv.end * 100) / 100,
       thumbnailUrl,
-      label: `Segment ${segments.length + 1}`,
+      label: `Clip ${segments.length + 1}`,
       selected: true,
     });
 
     onProgress({
-      percent: 85 + Math.round(((i + 1) / cutTimes.length) * 15),
-      status: `Thumbnail ${i + 1}/${cutTimes.length}...`,
+      percent: 85 + Math.round(((i + 1) / validIntervals.length) * 15),
+      status: `Thumbnail ${i + 1}/${validIntervals.length}...`,
     });
   }
 
@@ -616,7 +761,7 @@ export async function detectScenes(
   video.load();
   URL.revokeObjectURL(url);
 
-  onProgress({ percent: 100, status: `Found ${segments.length} segments` });
+  onProgress({ percent: 100, status: `Found ${segments.length} clips` });
   return segments;
 }
 
