@@ -866,7 +866,7 @@ export async function extractSegment(
 ): Promise<File> {
   const url = URL.createObjectURL(file);
   const video = document.createElement('video');
-  video.muted = true;
+  video.muted = false; // must be unmuted so audio flows through Web Audio
   video.playsInline = true;
   video.preload = 'auto';
   video.src = url;
@@ -891,13 +891,29 @@ export async function extractSegment(
   canvas.height = vh;
   const ctx = canvas.getContext('2d')!;
 
-  const stream = canvas.captureStream(30);
-  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+  // Set up Web Audio to capture audio from the video element
+  const audioCtx = new AudioContext();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  const audioSource = audioCtx.createMediaElementSource(video);
+  const audioDest = audioCtx.createMediaStreamDestination();
+  audioSource.connect(audioDest);
+
+  // Combine canvas video track + audio track into one stream
+  const videoStream = canvas.captureStream(30);
+  const combinedStream = new MediaStream([
+    ...videoStream.getVideoTracks(),
+    ...audioDest.stream.getAudioTracks(),
+  ]);
+
+  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+    ? 'video/webm;codecs=vp9,opus'
+    : MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
     ? 'video/webm;codecs=vp9'
     : 'video/webm';
-  const recorder = new MediaRecorder(stream, {
+  const recorder = new MediaRecorder(combinedStream, {
     mimeType,
     videoBitsPerSecond: 6000000,
+    audioBitsPerSecond: 128000,
   });
 
   const chunks: Blob[] = [];
@@ -922,6 +938,7 @@ export async function extractSegment(
       video.removeAttribute('src');
       video.load();
       URL.revokeObjectURL(url);
+      audioCtx.close().catch(() => {});
       resolve(segFile);
     };
 
