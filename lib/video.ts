@@ -194,7 +194,8 @@ export function drawOverlay(
   height: number,
   config: OverlayConfig,
   clips: Clip[],
-  activeIndex: number
+  activeIndex: number,
+  firstVisibleIndex: number = 0
 ) {
   const scale = height / 1920; // Scale relative to 1080x1920 reference
   const font = config.font || "'Bebas Neue', sans-serif";
@@ -267,6 +268,7 @@ export function drawOverlay(
   ctx.lineWidth = Math.max(2, Math.round(3 * scale));
 
   for (let i = 0; i < clips.length; i++) {
+    if (i < firstVisibleIndex) continue;
     const y = listStartY + i * itemHeight;
     const isActive = i === activeIndex;
     const alpha = isActive ? 1 : 0.7;
@@ -382,23 +384,30 @@ export async function exportVideo(
 
     recorder.start(100);
 
-    // 3. RENDER EACH CLIP
-    let clipIndex = 0;
+    // 3. RENDER EACH CLIP (countdown: lowest rank first, #1 last)
+    // playbackOrder maps step 0,1,2... to clip indices N-1, N-2, ...0
+    const totalClips = clips.length;
+    let step = 0;
 
     function renderClip() {
-      if (clipIndex >= clips.length) {
+      if (step >= totalClips) {
         onProgress({ percent: 100, status: 'Finalizing...' });
         recorder.stop();
         return;
       }
 
+      // Play from lowest rank to highest: clip N-1 first, clip 0 last
+      const clipIndex = totalClips - 1 - step;
       const video = videos[clipIndex];
       video.currentTime = 0;
       video.muted = true;
 
+      // firstVisibleIndex decreases as we reveal more items
+      const firstVisibleIndex = clipIndex;
+
       onProgress({
-        percent: 15 + Math.round((clipIndex / clips.length) * 80),
-        status: `Rendering clip ${clipIndex + 1}/${clips.length}: ${clips[clipIndex].label}`,
+        percent: 15 + Math.round((step / totalClips) * 80),
+        status: `Revealing #${clipIndex + 1}: ${clips[clipIndex].label}`,
       });
 
       try {
@@ -412,7 +421,7 @@ export async function exportVideo(
 
         if (elapsed >= clipDuration) {
           video.pause();
-          clipIndex++;
+          step++;
           renderClip();
           return;
         }
@@ -433,12 +442,12 @@ export async function exportVideo(
           ctx.drawImage(video, sx, sy, sw, sh);
         } catch {}
 
-        // Overlay
-        drawOverlay(ctx, width, height, config, clips, clipIndex);
+        // Overlay with countdown reveal
+        drawOverlay(ctx, width, height, config, clips, clipIndex, firstVisibleIndex);
 
         onProgress({
-          percent: 15 + Math.round(((clipIndex + elapsed / clipDuration) / clips.length) * 80),
-          status: `Rendering clip ${clipIndex + 1}/${clips.length}: ${clips[clipIndex].label}`,
+          percent: 15 + Math.round(((step + elapsed / clipDuration) / totalClips) * 80),
+          status: `Revealing #${clipIndex + 1}: ${clips[clipIndex].label}`,
         });
 
         requestAnimationFrame(drawFrame);
