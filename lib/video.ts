@@ -346,21 +346,25 @@ export async function exportVideo(
 
   // 2. SET UP AUDIO — Web Audio API to capture clip audio into the recording
   const audioCtx = new AudioContext();
+  // Resume AudioContext — browsers suspend it until a user gesture
+  if (audioCtx.state === 'suspended') {
+    await audioCtx.resume();
+  }
   const audioDest = audioCtx.createMediaStreamDestination();
 
   // Pre-create audio source nodes for each video
-  // Note: createMediaElementSource can only be called once per element
-  const audioSources: MediaElementAudioSourceNode[] = [];
+  // Note: createMediaElementSource can only be called once per element.
+  // Once attached, audio flows ONLY through Web Audio — not the element's
+  // default output. The element must NOT be muted for audio to flow.
   const gainNodes: GainNode[] = [];
   for (const v of videos) {
-    v.muted = false; // unmute so audio flows through the source node
+    v.muted = false;
     v.volume = 1;
     const source = audioCtx.createMediaElementSource(v);
     const gain = audioCtx.createGain();
     gain.gain.value = 0; // start silent — we'll enable per-clip
     source.connect(gain);
     gain.connect(audioDest);
-    audioSources.push(source);
     gainNodes.push(gain);
   }
 
@@ -440,6 +444,9 @@ export async function exportVideo(
         v.addEventListener('seeked', () => res(), { once: true });
         setTimeout(res, 3000);
       });
+      // Temporarily mute for autoplay policy compliance during pre-buffer,
+      // then unmute — audio routes through Web Audio, not the element output
+      v.muted = true;
       try { await v.play(); } catch {}
       if (v.readyState < 2) {
         await new Promise<void>((res) => {
@@ -451,8 +458,8 @@ export async function exportVideo(
           setTimeout(res, 2000);
         });
       }
-      // Pause immediately — we just needed it buffered and ready
       v.pause();
+      v.muted = false; // unmute for actual recording
       v.currentTime = 0;
       await new Promise<void>((res) => {
         v.addEventListener('seeked', () => res(), { once: true });
