@@ -1,4 +1,4 @@
-import { Clip, OverlayConfig, RANK_COLORS } from './types';
+import { Clip, OverlayConfig, RANK_COLORS, VideoSegment } from './types';
 
 // ─── Test Clip Generation ─────────────────────────────────────────
 
@@ -457,6 +457,263 @@ export async function exportVideo(
     }
 
     renderClip();
+  });
+}
+
+// ─── Scene Detection ─────────────────────────────────────────────
+
+export interface DetectionProgress {
+  percent: number;
+  status: string;
+}
+
+/**
+ * Analyzes a video for scene changes by comparing pixel differences
+ * between sampled frames. Returns timestamps where scene cuts occur.
+ */
+export async function detectScenes(
+  file: File,
+  onProgress: (p: DetectionProgress) => void,
+  sensitivity: number = 35 // 0-100, higher = more sensitive (more cuts detected)
+): Promise<VideoSegment[]> {
+  const url = URL.createObjectURL(file);
+  const video = document.createElement('video');
+  video.muted = true;
+  video.preload = 'auto';
+  video.src = url;
+
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Video load timed out')), 15000);
+    video.onloadeddata = () => {
+      clearTimeout(timeout);
+      resolve();
+    };
+    video.onerror = () => {
+      clearTimeout(timeout);
+      reject(new Error('Failed to load video'));
+    };
+  });
+
+  const duration = video.duration;
+  if (!duration || duration < 0.5) {
+    URL.revokeObjectURL(url);
+    throw new Error('Video is too short to analyze');
+  }
+
+  // Sample frames at intervals — ~4 frames/sec for good detection
+  const sampleInterval = 0.25;
+  const totalSamples = Math.floor(duration / sampleInterval);
+
+  // Small canvas for fast pixel comparison
+  const canvas = document.createElement('canvas');
+  const sampleWidth = 160;
+  const sampleHeight = 90;
+  canvas.width = sampleWidth;
+  canvas.height = sampleHeight;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+
+  let prevPixels: Uint8ClampedArray | null = null;
+  const diffs: { time: number; diff: number }[] = [];
+
+  onProgress({ percent: 0, status: 'Analyzing video for scene changes...' });
+
+  for (let i = 0; i < totalSamples; i++) {
+    const time = i * sampleInterval;
+
+    // Seek to time
+    await new Promise<void>((resolve) => {
+      video.currentTime = time;
+      video.onseeked = () => resolve();
+      // Safety fallback
+      setTimeout(resolve, 2000);
+    });
+
+    ctx.drawImage(video, 0, 0, sampleWidth, sampleHeight);
+    const imageData = ctx.getImageData(0, 0, sampleWidth, sampleHeight);
+    const pixels = imageData.data;
+
+    if (prevPixels) {
+      // Calculate mean absolute pixel difference
+      let totalDiff = 0;
+      const pixelCount = pixels.length / 4;
+      for (let p = 0; p < pixels.length; p += 4) {
+        totalDiff += Math.abs(pixels[p] - prevPixels[p]);     // R
+        totalDiff += Math.abs(pixels[p + 1] - prevPixels[p + 1]); // G
+        totalDiff += Math.abs(pixels[p + 2] - prevPixels[p + 2]); // B
+      }
+      const meanDiff = totalDiff / (pixelCount * 3); // 0-255
+      diffs.push({ time, diff: meanDiff });
+    }
+
+    prevPixels = new Uint8ClampedArray(pixels);
+
+    if (i % 10 === 0) {
+      onProgress({
+        percent: Math.round((i / totalSamples) * 80),
+        status: `Analyzing frame ${i + 1}/${totalSamples}...`,
+      });
+    }
+  }
+
+  // Find scene cuts: threshold based on sensitivity
+  // sensitivity 0 = threshold ~60 (only massive cuts)
+  // sensitivity 100 = threshold ~8 (very sensitive)
+  const threshold = 60 - (sensitivity / 100) * 52;
+  const minSegmentDuration = 1.0; // Minimum 1 second between cuts
+
+  const cutTimes: number[] = [0]; // Always start at 0
+
+  for (let i = 0; i < diffs.length; i++) {
+    if (diffs[i].diff > threshold) {
+      const lastCut = cutTimes[cutTimes.length - 1];
+      if (diffs[i].time - lastCut >= minSegmentDuration) {
+        cutTimes.push(diffs[i].time);
+      }
+    }
+  }
+
+  onProgress({ percent: 85, status: 'Generating segment thumbnails...' });
+
+  // Build segments
+  const segments: VideoSegment[] = [];
+  for (let i = 0; i < cutTimes.length; i++) {
+    const startTime = cutTimes[i];
+    const endTime = i < cutTimes.length - 1 ? cutTimes[i + 1] : duration;
+
+    // Skip very short trailing segments
+    if (endTime - startTime < 0.5) continue;
+
+    // Get thumbnail at segment midpoint
+    const thumbTime = startTime + (endTime - startTime) * 0.3;
+    let thumbnailUrl: string | null = null;
+    try {
+      await new Promise<void>((resolve) => {
+        video.currentTime = thumbTime;
+        video.onseeked = () => resolve();
+        setTimeout(resolve, 2000);
+      });
+      ctx.drawImage(video, 0, 0, sampleWidth, sampleHeight);
+      thumbnailUrl = canvas.toDataURL('image/jpeg', 0.7);
+    } catch {}
+
+    segments.push({
+      id: Math.random().toString(36).slice(2, 10),
+      startTime,
+      endTime,
+      thumbnailUrl,
+      label: `Segment ${segments.length + 1}`,
+      selected: true,
+    });
+
+    onProgress({
+      percent: 85 + Math.round(((i + 1) / cutTimes.length) * 15),
+      status: `Thumbnail ${i + 1}/${cutTimes.length}...`,
+    });
+  }
+
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  URL.revokeObjectURL(url);
+
+  onProgress({ percent: 100, status: `Found ${segments.length} segments` });
+  return segments;
+}
+
+/**
+ * Extracts a segment from a video file by re-recording the time range
+ * using Canvas + MediaRecorder.
+ */
+export async function extractSegment(
+  file: File,
+  startTime: number,
+  endTime: number,
+  onProgress?: (percent: number) => void
+): Promise<File> {
+  const url = URL.createObjectURL(file);
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.src = url;
+
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Load timed out')), 15000);
+    video.onloadeddata = () => {
+      clearTimeout(timeout);
+      resolve();
+    };
+    video.onerror = () => {
+      clearTimeout(timeout);
+      reject(new Error('Failed to load video'));
+    };
+  });
+
+  const vw = video.videoWidth || 720;
+  const vh = video.videoHeight || 1280;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = vw;
+  canvas.height = vh;
+  const ctx = canvas.getContext('2d')!;
+
+  const stream = canvas.captureStream(30);
+  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+    ? 'video/webm;codecs=vp9'
+    : 'video/webm';
+  const recorder = new MediaRecorder(stream, {
+    mimeType,
+    videoBitsPerSecond: 6000000,
+  });
+
+  const chunks: Blob[] = [];
+  recorder.ondataavailable = (e) => {
+    if (e.data.size > 0) chunks.push(e.data);
+  };
+
+  // Seek to start
+  await new Promise<void>((resolve) => {
+    video.currentTime = startTime;
+    video.onseeked = () => resolve();
+    setTimeout(resolve, 3000);
+  });
+
+  return new Promise((resolve, reject) => {
+    const segDuration = (endTime - startTime) * 1000;
+
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: mimeType });
+      const segFile = new File([blob], `segment-${startTime.toFixed(1)}s.webm`, { type: mimeType });
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+      URL.revokeObjectURL(url);
+      resolve(segFile);
+    };
+
+    recorder.onerror = () => reject(new Error('MediaRecorder error'));
+
+    recorder.start(100);
+
+    try {
+      video.play().catch(() => {});
+    } catch {}
+
+    const renderStart = performance.now();
+
+    function drawFrame() {
+      const elapsed = performance.now() - renderStart;
+      if (elapsed >= segDuration || video.currentTime >= endTime) {
+        recorder.stop();
+        return;
+      }
+
+      ctx.drawImage(video, 0, 0, vw, vh);
+      onProgress?.(Math.round((elapsed / segDuration) * 100));
+      requestAnimationFrame(drawFrame);
+    }
+
+    requestAnimationFrame(drawFrame);
   });
 }
 

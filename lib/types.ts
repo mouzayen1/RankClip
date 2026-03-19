@@ -49,5 +49,14 @@ export const FONTS = [
   { name: 'Oswald', value: "'Oswald', sans-serif" },
 ];
 
+export interface VideoSegment {
+  id: string;
+  startTime: number;
+  endTime: number;
+  thumbnailUrl: string | null;
+  label: string;
+  selected: boolean;
+}
+
 export const STEPS = ['Setup', 'Upload', 'Rank', 'Export'] as const;
 export type Step = (typeof STEPS)[number];

@@ -18,6 +18,7 @@ import {
   Check,
   Loader2,
   Sparkles,
+  Scissors,
   X,
 } from 'lucide-react';
 import {
@@ -38,6 +39,7 @@ import {
   exportVideo,
   ExportProgress,
 } from '@/lib/video';
+import VideoSplitter from './VideoSplitter';
 
 // ─── Helpers ──────────────────────────────────────────────────────
 
@@ -428,6 +430,7 @@ function StepUpload({
   setClips: (c: Clip[]) => void;
 }) {
   const [dragging, setDragging] = useState(false);
+  const [showSplitter, setShowSplitter] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const addFiles = useCallback(
@@ -490,6 +493,32 @@ function StepUpload({
           onChange={(e) => e.target.files && addFiles(e.target.files)}
         />
       </div>
+
+      {/* Auto-split button */}
+      <div className="flex justify-center">
+        <motion.button
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
+          onClick={() => setShowSplitter(true)}
+          className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium bg-gradient-to-r from-[#FF6B1A]/10 to-[#FFD700]/10 border border-[#FF6B1A]/30 hover:border-[#FF6B1A]/50 text-[#FF6B1A] transition-all"
+        >
+          <Scissors className="w-4 h-4" />
+          Auto-Split a Long Video
+        </motion.button>
+      </div>
+
+      {/* Splitter Modal */}
+      <AnimatePresence>
+        {showSplitter && (
+          <VideoSplitter
+            onClose={() => setShowSplitter(false)}
+            onSegmentsReady={(newClips) => {
+              setClips([...clips, ...newClips]);
+              setShowSplitter(false);
+            }}
+          />
+        )}
+      </AnimatePresence>
 
       {/* Clip list */}
       {clips.length > 0 && (
