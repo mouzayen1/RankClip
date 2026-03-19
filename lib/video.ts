@@ -437,9 +437,10 @@ export async function exportVideo(
   return new Promise((resolve, reject) => {
     recorder.onstop = async () => {
       const rawBlob = new Blob(chunks, { type: mimeType });
+      const renderedMs = (recorder as unknown as Record<string, number>)._actualDuration || totalDurationMs;
 
       // Fix WebM duration/seeking metadata (no-op for MP4)
-      const blob = await fixBlobMetadata(rawBlob, totalDurationMs);
+      const blob = await fixBlobMetadata(rawBlob, renderedMs);
       const url = URL.createObjectURL(blob);
 
       // CLEANUP
@@ -493,7 +494,7 @@ export async function exportVideo(
         await new Promise<void>((res) => {
           const check = () => {
             if (v.readyState >= 2) res();
-            else requestAnimationFrame(check);
+            else setTimeout(check, 50);
           };
           check();
           setTimeout(res, 2000);
@@ -519,6 +520,7 @@ export async function exportVideo(
 
     // 7. RENDER EACH CLIP (countdown: lowest rank first, #1 last)
     const totalClips = clips.length;
+    const renderStartTime = performance.now();
 
     for (let step = 0; step < totalClips; step++) {
       const clipIndex = totalClips - 1 - step;
@@ -538,52 +540,54 @@ export async function exportVideo(
       // Play — video is already buffered and seeked to 0, so this is instant
       try { await video.play(); } catch {}
 
-      // Render frames for this clip's duration
-      await new Promise<void>((resolve) => {
-        const startTime = performance.now();
+      // Render frames for this clip's duration using setTimeout for
+      // reliable rendering on mobile (requestAnimationFrame gets throttled
+      // when the device is under heavy load or the tab loses focus).
+      const FRAME_INTERVAL = 33; // ~30 fps to match captureStream(30)
+      const startTime = performance.now();
 
-        function drawFrame() {
-          const elapsed = performance.now() - startTime;
+      while (true) {
+        const elapsed = performance.now() - startTime;
 
-          if (elapsed >= clipDuration) {
-            video.pause();
-            gainNodes[clipIndex].gain.value = 0;
-            resolve();
-            return;
-          }
-
-          // Black background
-          ctx.fillStyle = '#000000';
-          ctx.fillRect(0, 0, width, height);
-
-          // Cover-fill video
-          try {
-            const vw = video.videoWidth || width;
-            const vh = video.videoHeight || height;
-            const scale = Math.max(width / vw, height / vh);
-            const sw = vw * scale;
-            const sh = vh * scale;
-            const sx = (width - sw) / 2;
-            const sy = (height - sh) / 2;
-            ctx.drawImage(video, sx, sy, sw, sh);
-          } catch {}
-
-          // Overlay with countdown reveal
-          drawOverlay(ctx, width, height, config, clips, clipIndex, firstVisibleIndex);
-
-          onProgress({
-            percent: 20 + Math.round(((step + elapsed / clipDuration) / totalClips) * 75),
-            status: `Revealing #${clipIndex + 1}: ${clips[clipIndex].label}`,
-          });
-
-          requestAnimationFrame(drawFrame);
+        if (elapsed >= clipDuration) {
+          video.pause();
+          gainNodes[clipIndex].gain.value = 0;
+          break;
         }
 
-        requestAnimationFrame(drawFrame);
-      });
+        // Black background
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, 0, width, height);
+
+        // Cover-fill video
+        try {
+          const vw = video.videoWidth || width;
+          const vh = video.videoHeight || height;
+          const coverScale = Math.max(width / vw, height / vh);
+          const sw = vw * coverScale;
+          const sh = vh * coverScale;
+          const sx = (width - sw) / 2;
+          const sy = (height - sh) / 2;
+          ctx.drawImage(video, sx, sy, sw, sh);
+        } catch {}
+
+        // Overlay with countdown reveal
+        drawOverlay(ctx, width, height, config, clips, clipIndex, firstVisibleIndex);
+
+        onProgress({
+          percent: 20 + Math.round(((step + elapsed / clipDuration) / totalClips) * 75),
+          status: `Revealing #${clipIndex + 1}: ${clips[clipIndex].label}`,
+        });
+
+        // Yield to the event loop so MediaRecorder can collect frames
+        await new Promise<void>((r) => setTimeout(r, FRAME_INTERVAL));
+      }
     }
 
+    const actualDurationMs = performance.now() - renderStartTime;
     onProgress({ percent: 100, status: 'Finalizing...' });
+    // Stash actual duration so onstop handler can use it
+    (recorder as unknown as Record<string, number>)._actualDuration = actualDurationMs;
     recorder.stop();
 
     })(); // end async IIFE
@@ -991,19 +995,20 @@ export async function extractSegment(
 
     const renderStart = performance.now();
 
-    function drawFrame() {
-      const elapsed = performance.now() - renderStart;
-      if (elapsed >= segDuration || video.currentTime >= endTime) {
-        recorder.stop();
-        return;
+    (async () => {
+      const FRAME_MS = 33; // ~30fps
+      while (true) {
+        const elapsed = performance.now() - renderStart;
+        if (elapsed >= segDuration || video.currentTime >= endTime) {
+          recorder.stop();
+          return;
+        }
+
+        ctx.drawImage(video, 0, 0, vw, vh);
+        onProgress?.(Math.round((elapsed / segDuration) * 100));
+        await new Promise<void>((r) => setTimeout(r, FRAME_MS));
       }
-
-      ctx.drawImage(video, 0, 0, vw, vh);
-      onProgress?.(Math.round((elapsed / segDuration) * 100));
-      requestAnimationFrame(drawFrame);
-    }
-
-    requestAnimationFrame(drawFrame);
+    })();
   });
 }
 
