@@ -52,9 +52,9 @@ function uid() {
 export default function RankClipEditor() {
   const [step, setStep] = useState<Step>('Setup');
   const [config, setConfig] = useState<OverlayConfig>({
-    prefix: '',
-    highlight: '',
-    suffix: '',
+    prefix: 'Top 5',
+    highlight: 'funniest',
+    suffix: 'moments',
     highlightColor: HIGHLIGHT_COLORS[0],
     font: FONTS[0].value,
     clipDuration: 4,

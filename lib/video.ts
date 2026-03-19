@@ -329,7 +329,7 @@ export async function exportVideo(
 ): Promise<string> {
   const { width, height } = config.resolution;
   const clipDuration = config.clipDuration * 1000; // ms
-  const fadeDuration = 300; // ms — fade-in/fade-out at clip boundaries
+  // No fade — instant hard cuts between clips
 
   onProgress({ percent: 0, status: 'Preloading videos...' });
 
@@ -518,21 +518,6 @@ export async function exportVideo(
           const sy = (height - sh) / 2;
           ctx.drawImage(video, sx, sy, sw, sh);
         } catch {}
-
-        // Fade-in at start, fade-out at end of each clip
-        const fadeIn = Math.min(elapsed / fadeDuration, 1);
-        const fadeOut = Math.min((clipDuration - elapsed) / fadeDuration, 1);
-        const fade = Math.min(fadeIn, fadeOut);
-
-        if (fade < 1) {
-          ctx.fillStyle = `rgba(0, 0, 0, ${1 - fade})`;
-          ctx.fillRect(0, 0, width, height);
-
-          // Also fade audio to match
-          gainNodes[clipIndex].gain.value = fade;
-        } else {
-          gainNodes[clipIndex].gain.value = 1;
-        }
 
         // Overlay with countdown reveal
         drawOverlay(ctx, width, height, config, clips, clipIndex, firstVisibleIndex);
@@ -840,7 +825,7 @@ export async function detectScenes(
       startTime: Math.round(iv.start * 100) / 100,
       endTime: Math.round(iv.end * 100) / 100,
       thumbnailUrl,
-      label: `Clip ${segments.length + 1}`,
+      label: '',
       selected: true,
     });
 
