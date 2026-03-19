@@ -384,12 +384,27 @@ export async function exportVideo(
 
     recorder.start(100);
 
-    // 3. RENDER EACH CLIP (countdown: lowest rank first, #1 last)
-    // playbackOrder maps step 0,1,2... to clip indices N-1, N-2, ...0
+    // Use async IIFE since Promise constructor isn't async
+    (async () => {
+
+    // 3. PRE-SEEK all videos to time 0 so they're ready to play instantly
+    const seekPromises = videos.map(
+      (v) =>
+        new Promise<void>((res) => {
+          v.currentTime = 0;
+          v.muted = true;
+          const done = () => res();
+          v.addEventListener('seeked', done, { once: true });
+          setTimeout(done, 3000);
+        })
+    );
+    await Promise.all(seekPromises);
+
+    // 4. RENDER EACH CLIP (countdown: lowest rank first, #1 last)
     const totalClips = clips.length;
     let step = 0;
 
-    function renderClip() {
+    async function renderClip() {
       if (step >= totalClips) {
         onProgress({ percent: 100, status: 'Finalizing...' });
         recorder.stop();
@@ -399,21 +414,49 @@ export async function exportVideo(
       // Play from lowest rank to highest: clip N-1 first, clip 0 last
       const clipIndex = totalClips - 1 - step;
       const video = videos[clipIndex];
-      video.currentTime = 0;
-      video.muted = true;
 
       // firstVisibleIndex decreases as we reveal more items
       const firstVisibleIndex = clipIndex;
 
       onProgress({
         percent: 15 + Math.round((step / totalClips) * 80),
+        status: `Preparing #${clipIndex + 1}: ${clips[clipIndex].label}`,
+      });
+
+      // Seek to beginning and wait for it to be ready
+      video.currentTime = 0;
+      await new Promise<void>((res) => {
+        const done = () => res();
+        video.addEventListener('seeked', done, { once: true });
+        setTimeout(done, 3000);
+      });
+
+      // Start playback and wait for it to actually begin
+      try {
+        await video.play();
+      } catch {}
+
+      // Wait until the video is producing frames (readyState >= HAVE_CURRENT_DATA)
+      if (video.readyState < 2) {
+        await new Promise<void>((res) => {
+          const check = () => {
+            if (video.readyState >= 2) {
+              res();
+            } else {
+              requestAnimationFrame(check);
+            }
+          };
+          check();
+          setTimeout(res, 2000); // safety
+        });
+      }
+
+      onProgress({
+        percent: 15 + Math.round((step / totalClips) * 80),
         status: `Revealing #${clipIndex + 1}: ${clips[clipIndex].label}`,
       });
 
-      try {
-        video.play().catch(() => {});
-      } catch {}
-
+      // NOW start the timer — video is actually playing
       const startTime = performance.now();
 
       function drawFrame() {
@@ -457,6 +500,8 @@ export async function exportVideo(
     }
 
     renderClip();
+
+    })(); // end async IIFE
   });
 }
 
