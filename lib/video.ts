@@ -1,67 +1,43 @@
-import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import fixWebmDuration from 'fix-webm-duration';
 import { Clip, OverlayConfig, RANK_COLORS, VideoSegment } from './types';
 
-// ─── WebM → MP4 Conversion (ffmpeg.wasm) ─────────────────────────
+// ─── Recording Format Helpers ─────────────────────────────────────
 
-let ffmpegInstance: FFmpeg | null = null;
-
-async function getFFmpeg(): Promise<FFmpeg> {
-  if (ffmpegInstance && ffmpegInstance.loaded) return ffmpegInstance;
-
-  const ffmpeg = new FFmpeg();
-  const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
-
-  await ffmpeg.load({
-    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-  });
-
-  ffmpegInstance = ffmpeg;
-  return ffmpeg;
+/** Pick the best MIME type for MediaRecorder: prefer MP4 (H.264+AAC) for
+ *  broad compatibility (TikTok, Instagram, etc.), fall back to WebM. */
+export function pickRecorderMime(): { mimeType: string; ext: string } {
+  // MP4 — supported in Chrome 120+, Safari
+  const mp4Types = [
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4;codecs=avc1,mp4a.40.2',
+    'video/mp4',
+  ];
+  for (const t of mp4Types) {
+    if (MediaRecorder.isTypeSupported(t)) return { mimeType: t, ext: 'mp4' };
+  }
+  // WebM fallback
+  const webmTypes = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+  ];
+  for (const t of webmTypes) {
+    if (MediaRecorder.isTypeSupported(t)) return { mimeType: t, ext: 'webm' };
+  }
+  return { mimeType: 'video/webm', ext: 'webm' };
 }
 
-/**
- * Converts a WebM blob to MP4 (H.264 + AAC) for broad compatibility.
- * This fixes:
- * - Seeking/scrubbing (MP4 has proper moov atom with seek index)
- * - TikTok/Instagram/social media uploads (require MP4)
- */
-export async function convertToMp4(
-  webmBlob: Blob,
-  onProgress?: (percent: number) => void
+/** Fix WebM duration/seeking metadata. No-op for MP4. */
+export async function fixBlobMetadata(
+  blob: Blob,
+  durationMs: number
 ): Promise<Blob> {
-  const ffmpeg = await getFFmpeg();
-
-  ffmpeg.on('progress', ({ progress }) => {
-    onProgress?.(Math.round(progress * 100));
+  if (blob.type.startsWith('video/mp4')) return blob;
+  // fix-webm-duration patches the WebM header with correct duration + cues
+  return new Promise<Blob>((resolve) => {
+    fixWebmDuration(blob, durationMs, (fixed: Blob) => resolve(fixed));
   });
-
-  const inputData = await fetchFile(webmBlob);
-  await ffmpeg.writeFile('input.webm', inputData);
-
-  // Convert with H.264 video + AAC audio, faststart for streaming/seeking
-  await ffmpeg.exec([
-    '-i', 'input.webm',
-    '-c:v', 'libx264',
-    '-preset', 'fast',
-    '-crf', '23',
-    '-c:a', 'aac',
-    '-b:a', '128k',
-    '-movflags', '+faststart',
-    '-pix_fmt', 'yuv420p',
-    'output.mp4',
-  ]);
-
-  const outputData = await ffmpeg.readFile('output.mp4');
-  // ffmpeg.wasm returns Uint8Array with SharedArrayBuffer backing; cast for Blob compat
-  const mp4Blob = new Blob([(outputData as unknown) as BlobPart], { type: 'video/mp4' });
-
-  // Cleanup temp files
-  await ffmpeg.deleteFile('input.webm');
-  await ffmpeg.deleteFile('output.mp4');
-
-  return mp4Blob;
 }
 
 // ─── Test Clip Generation ─────────────────────────────────────────
@@ -444,11 +420,7 @@ export async function exportVideo(
     ...audioDest.stream.getAudioTracks(),
   ]);
 
-  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
-    ? 'video/webm;codecs=vp9,opus'
-    : MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-    ? 'video/webm;codecs=vp9'
-    : 'video/webm';
+  const { mimeType } = pickRecorderMime();
   const recorder = new MediaRecorder(combinedStream, {
     mimeType,
     videoBitsPerSecond: 6000000,
@@ -460,9 +432,14 @@ export async function exportVideo(
     if (e.data.size > 0) chunks.push(e.data);
   };
 
+  const totalDurationMs = clips.length * clipDuration;
+
   return new Promise((resolve, reject) => {
-    recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: mimeType });
+    recorder.onstop = async () => {
+      const rawBlob = new Blob(chunks, { type: mimeType });
+
+      // Fix WebM duration/seeking metadata (no-op for MP4)
+      const blob = await fixBlobMetadata(rawBlob, totalDurationMs);
       const url = URL.createObjectURL(blob);
 
       // CLEANUP
@@ -969,11 +946,7 @@ export async function extractSegment(
     ...audioDest.stream.getAudioTracks(),
   ]);
 
-  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
-    ? 'video/webm;codecs=vp9,opus'
-    : MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-    ? 'video/webm;codecs=vp9'
-    : 'video/webm';
+  const { mimeType } = pickRecorderMime();
   const recorder = new MediaRecorder(combinedStream, {
     mimeType,
     videoBitsPerSecond: 6000000,
@@ -995,9 +968,11 @@ export async function extractSegment(
   return new Promise((resolve, reject) => {
     const segDuration = (endTime - startTime) * 1000;
 
-    recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: mimeType });
-      const segFile = new File([blob], `segment-${startTime.toFixed(1)}s.webm`, { type: mimeType });
+    recorder.onstop = async () => {
+      const rawBlob = new Blob(chunks, { type: mimeType });
+      const blob = await fixBlobMetadata(rawBlob, segDuration);
+      const ext = mimeType.startsWith('video/mp4') ? 'mp4' : 'webm';
+      const segFile = new File([blob], `segment-${startTime.toFixed(1)}s.${ext}`, { type: mimeType });
       video.pause();
       video.removeAttribute('src');
       video.load();

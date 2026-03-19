@@ -37,7 +37,7 @@ import {
   generateThumbnail,
   drawOverlay,
   exportVideo,
-  convertToMp4,
+  pickRecorderMime,
   ExportProgress,
 } from '@/lib/video';
 import VideoSplitter from './VideoSplitter';
@@ -731,23 +731,8 @@ function StepExport({
     setExporting(true);
     setExportedUrl(null);
     try {
-      // Step 1: Record WebM
-      const webmUrl = await exportVideo(clips, config, setExportProgress);
-
-      // Step 2: Convert WebM → MP4 for seeking + social media compatibility
-      setExportProgress({ percent: 95, status: 'Converting to MP4...' });
-      const webmBlob = await fetch(webmUrl).then((r) => r.blob());
-      URL.revokeObjectURL(webmUrl);
-
-      const mp4Blob = await convertToMp4(webmBlob, (p) => {
-        setExportProgress({
-          percent: 95 + Math.round(p * 0.05),
-          status: `Converting to MP4... ${p}%`,
-        });
-      });
-
-      const mp4Url = URL.createObjectURL(mp4Blob);
-      setExportedUrl(mp4Url);
+      const url = await exportVideo(clips, config, setExportProgress);
+      setExportedUrl(url);
     } catch (err) {
       console.error('Export failed:', err);
       setExportProgress({ percent: 0, status: 'Export failed. Try again.' });
@@ -755,12 +740,15 @@ function StepExport({
     setExporting(false);
   };
 
+  // Determine file extension based on what the browser records
+  const downloadExt = typeof window !== 'undefined' ? pickRecorderMime().ext : 'mp4';
+
   const handleDownload = () => {
     if (!exportedUrl) return;
     const a = document.createElement('a');
     a.href = exportedUrl;
     const title = `${config.prefix} ${config.highlight} ${config.suffix}`.trim().replace(/\s+/g, '-');
-    a.download = `${title}-rankclip.mp4`;
+    a.download = `${title}-rankclip.${downloadExt}`;
     a.click();
   };
 
