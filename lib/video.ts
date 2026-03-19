@@ -1,4 +1,68 @@
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import { Clip, OverlayConfig, RANK_COLORS, VideoSegment } from './types';
+
+// ─── WebM → MP4 Conversion (ffmpeg.wasm) ─────────────────────────
+
+let ffmpegInstance: FFmpeg | null = null;
+
+async function getFFmpeg(): Promise<FFmpeg> {
+  if (ffmpegInstance && ffmpegInstance.loaded) return ffmpegInstance;
+
+  const ffmpeg = new FFmpeg();
+  const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+
+  await ffmpeg.load({
+    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+  });
+
+  ffmpegInstance = ffmpeg;
+  return ffmpeg;
+}
+
+/**
+ * Converts a WebM blob to MP4 (H.264 + AAC) for broad compatibility.
+ * This fixes:
+ * - Seeking/scrubbing (MP4 has proper moov atom with seek index)
+ * - TikTok/Instagram/social media uploads (require MP4)
+ */
+export async function convertToMp4(
+  webmBlob: Blob,
+  onProgress?: (percent: number) => void
+): Promise<Blob> {
+  const ffmpeg = await getFFmpeg();
+
+  ffmpeg.on('progress', ({ progress }) => {
+    onProgress?.(Math.round(progress * 100));
+  });
+
+  const inputData = await fetchFile(webmBlob);
+  await ffmpeg.writeFile('input.webm', inputData);
+
+  // Convert with H.264 video + AAC audio, faststart for streaming/seeking
+  await ffmpeg.exec([
+    '-i', 'input.webm',
+    '-c:v', 'libx264',
+    '-preset', 'fast',
+    '-crf', '23',
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-movflags', '+faststart',
+    '-pix_fmt', 'yuv420p',
+    'output.mp4',
+  ]);
+
+  const outputData = await ffmpeg.readFile('output.mp4');
+  // ffmpeg.wasm returns Uint8Array with SharedArrayBuffer backing; cast for Blob compat
+  const mp4Blob = new Blob([(outputData as unknown) as BlobPart], { type: 'video/mp4' });
+
+  // Cleanup temp files
+  await ffmpeg.deleteFile('input.webm');
+  await ffmpeg.deleteFile('output.mp4');
+
+  return mp4Blob;
+}
 
 // ─── Test Clip Generation ─────────────────────────────────────────
 
